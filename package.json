@@ -1,0 +1,19 @@
+{
+  "name": "pi-mr-sentinel",
+  "version": "0.2.0",
+  "packageManager": "pnpm@10.33.0",
+  "description": "Pi tools for browser acceptance evidence, Codebase merge requests, and session-scoped MR babysitting",
+  "keywords": ["pi-package", "merge-request", "codebase", "playwright"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "check": "pi --no-extensions --no-context-files -e ./extensions/index.ts -p 'Reply with OK only.'"
+  }
+}
