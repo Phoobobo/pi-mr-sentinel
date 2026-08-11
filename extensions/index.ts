@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import {
   formatSize,
-  isToolCallEventType,
   truncateHead,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
@@ -76,35 +75,123 @@ function truncate(output: string): string {
     : result.content;
 }
 
+type MergeRequest = {
+  state: string;
+  url?: string;
+  baseRef?: string;
+};
+
+const MONITOR_DELAYS_MS = [5, 10, 20, 40, 90].map((minutes) => minutes * 60_000);
+const REPEAT_MONITOR_DELAY_MS = 90 * 60_000;
+
 export default function mrSentinel(pi: ExtensionAPI) {
+  let monitorTimer: ReturnType<typeof setTimeout> | undefined;
+  let monitorAttempt = 0;
+  let conflictResolutionQueued = false;
+
+  const nextMonitorDelay = () => MONITOR_DELAYS_MS[monitorAttempt++] ?? REPEAT_MONITOR_DELAY_MS;
+
+  async function tryExec(command: string, args: string[], cwd: string) {
+    try {
+      return await pi.exec(command, args, { cwd, timeout: COMMAND_TIMEOUT_MS });
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function findMergeRequest(cwd: string): Promise<MergeRequest | undefined> {
+    const gh = await tryExec("gh", ["pr", "view", "--json", "state,url,baseRefName"], cwd);
+    if (gh?.code === 0) {
+      const result = JSON.parse(gh.stdout) as { state: string; url?: string; baseRefName?: string };
+      return { state: result.state, url: result.url, baseRef: result.baseRefName };
+    }
+
+    const glab = await tryExec("glab", ["mr", "view", "--output", "json"], cwd);
+    if (!glab || glab.code !== 0) return undefined;
+    const result = JSON.parse(glab.stdout) as { state: string; web_url?: string; target_branch?: string };
+    return { state: result.state, url: result.web_url, baseRef: result.target_branch };
+  }
+
+  async function rebaseIfBehind(cwd: string, baseRef: string, ctx: { ui: { setStatus(key: string, value?: string): void } }): Promise<boolean> {
+    const paused = await pi.exec("git", ["rev-parse", "-q", "--verify", "REBASE_HEAD"], { cwd, timeout: COMMAND_TIMEOUT_MS });
+    if (paused.code === 0) {
+      ctx.ui.setStatus("mr-sentinel", "MR monitor: rebase conflict needs resolution");
+      if (!conflictResolutionQueued) {
+        conflictResolutionQueued = true;
+        pi.sendUserMessage(
+          "The MR monitor found a paused rebase with conflicts. Resolve every conflict in the current repository, run git add for each resolution, run git rebase --continue, then git push --force-with-lease. Do not ask for confirmation.",
+          { deliverAs: "followUp" },
+        );
+      }
+      return true;
+    }
+    conflictResolutionQueued = false;
+
+    const fetch = await pi.exec("git", ["fetch", "origin", baseRef], { cwd, timeout: COMMAND_TIMEOUT_MS });
+    if (fetch.code !== 0) throw new Error(`fetch ${baseRef} failed: ${truncate(fetch.stderr || fetch.stdout)}`);
+    const behind = await pi.exec("git", ["rev-list", "--count", `HEAD..origin/${baseRef}`], { cwd, timeout: COMMAND_TIMEOUT_MS });
+    if (behind.code !== 0 || Number.parseInt(behind.stdout.trim(), 10) === 0) return false;
+
+    ctx.ui.setStatus("mr-sentinel", `MR monitor: rebasing onto ${baseRef}`);
+    const rebase = await pi.exec("git", ["rebase", `origin/${baseRef}`], { cwd, timeout: COMMAND_TIMEOUT_MS });
+    if (rebase.code === 0) {
+      const push = await pi.exec("git", ["push", "--force-with-lease"], { cwd, timeout: COMMAND_TIMEOUT_MS });
+      if (push.code !== 0) throw new Error(`push after rebase failed: ${truncate(push.stderr || push.stdout)}`);
+      return false;
+    }
+
+    const conflicts = await pi.exec("git", ["diff", "--name-only", "--diff-filter=U"], { cwd, timeout: COMMAND_TIMEOUT_MS });
+    if (conflicts.stdout.trim()) {
+      return rebaseIfBehind(cwd, baseRef, ctx);
+    }
+    throw new Error(`rebase failed: ${truncate(rebase.stderr || rebase.stdout)}`);
+  }
+
+  function startMonitor(ctx: { cwd: string; ui: { setStatus(key: string, value?: string): void } }) {
+    if (monitorTimer) clearTimeout(monitorTimer);
+    monitorAttempt = 0;
+    const poll = async () => {
+      try {
+        const mr = await findMergeRequest(ctx.cwd);
+        if (!mr) {
+          ctx.ui.setStatus("mr-sentinel", "MR monitor: waiting for a merge request");
+        } else if (["MERGED", "CLOSED", "merged", "closed"].includes(mr.state)) {
+          ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}`);
+          monitorTimer = undefined;
+          return;
+        } else {
+          const awaitingConflictResolution = mr.baseRef && await rebaseIfBehind(ctx.cwd, mr.baseRef, ctx);
+          if (!awaitingConflictResolution) {
+            ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}${mr.url ? ` (${mr.url})` : ""}`);
+          }
+        }
+      } catch (error) {
+        ctx.ui.setStatus("mr-sentinel", `MR monitor error: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      monitorTimer = setTimeout(() => void poll(), nextMonitorDelay());
+    };
+    void poll();
+  }
+
+  pi.on("session_shutdown", () => {
+    if (monitorTimer) clearTimeout(monitorTimer);
+    monitorTimer = undefined;
+  });
+
+  pi.on("tool_result", (event, ctx) => {
+    if (event.toolName !== "bash" || event.isError) return;
+    const command = (event.input as { command?: string }).command ?? "";
+    if (/(?:^|[;&|]\s*)(?:gh\s+(?:pr|repo)|glab\s+mr)\s+create\b/m.test(command)) startMonitor(ctx);
+  });
+
   pi.registerCommand("mr-sentinel", {
     description: "Inspect the current Git change and create/watch a merge request using the host-appropriate CLI",
     handler: async (_args, ctx) => {
-      if (!ctx.hasUI) {
-        ctx.ui.notify("/mr-sentinel requires interactive mode for side-effect confirmations", "error");
-        return;
-      }
+      startMonitor(ctx);
       pi.sendUserMessage(
-        "Prepare a merge request for the current repository. Inspect git status, the relevant diff, and git remote -v first. Select the command-line client appropriate for the remote host: prefer gh for GitHub; for any other host, discover an already-installed suitable client with command -v and --help. Do not install software, alter credentials, expose tokens, or assume a platform-specific client. First check whether this branch already has a merge request. If it does, keep monitoring that merge request with the detected client until it is merged or closed; do not conclude while it remains open. If it does not, generate a concise conventional-commit title and a factual Markdown body without asking me for a title, then create the merge request. Before merge-request creation, state the exact planned action and wait for the extension confirmation prompt. After creation, keep monitoring it with the same client until it is merged or closed; do not conclude while it remains open.",
+        "Prepare a merge request for the current repository. Inspect git status, the relevant diff, and git remote -v first. Select the command-line client appropriate for the remote host: prefer gh for GitHub; for any other host, discover an already-installed suitable client with command -v and --help. Do not install software, alter credentials, expose tokens, or assume a platform-specific client. First check whether this branch already has a merge request. If it does not, generate a concise conventional-commit title and a factual Markdown body without asking me for a title, then commit, push, and create the merge request without asking for confirmation. The extension monitors the merge request after this command starts.",
       );
     },
-  });
-
-  // The extension remains host-neutral. It gates common merge-request creation
-  // commands, while an unfamiliar hosting client is selected by the model only
-  // after it has inspected the repository remote and available executables.
-  pi.on("tool_call", async (event, ctx) => {
-    if (!isToolCallEventType("bash", event)) return;
-    const command = event.input.command ?? "";
-    const isMergeRequestCreation = /(?:^|[;&|]\s*)gh\s+(?:pr|repo)\s+create\b/m.test(command)
-      || /(?:^|[;&|]\s*)glab\s+mr\s+create\b/m.test(command);
-    if (!isMergeRequestCreation) return;
-    if (!ctx.hasUI) return { block: true, reason: "Blocked merge-request creation without an interactive confirmation" };
-    const confirmed = await ctx.ui.confirm(
-      "Allow merge-request creation?",
-      `The agent wants to run:\n${truncate(command)}\n\nAllow this merge-request creation?`,
-    );
-    if (!confirmed) return { block: true, reason: "Merge-request creation cancelled by user" };
   });
 
   pi.registerTool({

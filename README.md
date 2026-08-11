@@ -24,10 +24,10 @@ Restart Pi or run `/reload` after installation.
 
 ## Interface
 
-- `/mr-sentinel` inspects Git status, diff, and remote; then selects a suitable already-installed client for the hosting platform. It prefers `gh` for GitHub and discovers another client for other remotes. It monitors an existing or newly created merge request until it is merged or closed.
+- `/mr-sentinel` inspects Git status, diff, and remote; then selects a suitable already-installed client for the hosting platform. It prefers `gh` for GitHub and discovers another client for other remotes. While Pi remains open, it polls an existing or newly created GitHub/GitLab merge request immediately, then after 5, 10, 20, 40, and 90 minutes, and every 90 minutes thereafter, until it is merged or closed. On each open-MR poll, it rebases the branch onto the MR target branch if behind, pushes the rebase with `--force-with-lease`, and queues the agent to resolve any rebase conflicts.
 - `mr_browser_acceptance` performs bounded Playwright CLI actions and preserves a PNG screenshot plus command log.
 
-The command does not install clients, change authentication, or expose credentials. It asks for confirmation before `gh pr create`, `gh repo create`, and `glab mr create`; Git commits and pushes run without an extension confirmation.
+The command does not install clients, change authentication, or expose credentials. It does not request extension confirmations for Git commits, pushes, merge-request creation, rebases, or force-with-lease pushes.
 
 ## Browser configuration
 
