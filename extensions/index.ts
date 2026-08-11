@@ -85,27 +85,26 @@ export default function mrSentinel(pi: ExtensionAPI) {
         return;
       }
       pi.sendUserMessage(
-        "Prepare a merge request for the current repository. Inspect git status, the relevant diff, and git remote -v first. Generate a concise conventional-commit title and a factual Markdown body without asking me for a title. Select the command-line client appropriate for the remote host: prefer gh for GitHub; for any other host, discover an already-installed suitable client with command -v and --help. Do not install software, alter credentials, expose tokens, or assume a platform-specific client. Before any commit, push, or merge-request creation, state the exact planned action and wait for the extension confirmation prompt. After creation, use the same detected client to query or watch the merge request when that client supports it; otherwise report the created URL and the manual watch command.",
+        "Prepare a merge request for the current repository. Inspect git status, the relevant diff, and git remote -v first. Select the command-line client appropriate for the remote host: prefer gh for GitHub; for any other host, discover an already-installed suitable client with command -v and --help. Do not install software, alter credentials, expose tokens, or assume a platform-specific client. First check whether this branch already has a merge request. If it does, keep monitoring that merge request with the detected client until it is merged or closed; do not conclude while it remains open. If it does not, generate a concise conventional-commit title and a factual Markdown body without asking me for a title, then create the merge request. Before merge-request creation, state the exact planned action and wait for the extension confirmation prompt. After creation, keep monitoring it with the same client until it is merged or closed; do not conclude while it remains open.",
       );
     },
   });
 
-  // The extension remains host-neutral. It gates common local and GitHub write
+  // The extension remains host-neutral. It gates common merge-request creation
   // commands, while an unfamiliar hosting client is selected by the model only
   // after it has inspected the repository remote and available executables.
   pi.on("tool_call", async (event, ctx) => {
     if (!isToolCallEventType("bash", event)) return;
     const command = event.input.command ?? "";
-    const isWrite = /(?:^|[;&|]\s*)git\s+(?:commit|push)\b/m.test(command)
-      || /(?:^|[;&|]\s*)gh\s+(?:pr|repo)\s+(?:create|fork)\b/m.test(command)
+    const isMergeRequestCreation = /(?:^|[;&|]\s*)gh\s+(?:pr|repo)\s+create\b/m.test(command)
       || /(?:^|[;&|]\s*)glab\s+mr\s+create\b/m.test(command);
-    if (!isWrite) return;
-    if (!ctx.hasUI) return { block: true, reason: "Blocked merge-request side effect without an interactive confirmation" };
+    if (!isMergeRequestCreation) return;
+    if (!ctx.hasUI) return { block: true, reason: "Blocked merge-request creation without an interactive confirmation" };
     const confirmed = await ctx.ui.confirm(
-      "Allow merge-request side effect?",
-      `The agent wants to run:\n${truncate(command)}\n\nAllow this commit, push, or merge-request creation?`,
+      "Allow merge-request creation?",
+      `The agent wants to run:\n${truncate(command)}\n\nAllow this merge-request creation?`,
     );
-    if (!confirmed) return { block: true, reason: "Merge-request side effect cancelled by user" };
+    if (!confirmed) return { block: true, reason: "Merge-request creation cancelled by user" };
   });
 
   pi.registerTool({

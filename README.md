@@ -24,10 +24,10 @@ Restart Pi or run `/reload` after installation.
 
 ## Interface
 
-- `/mr-sentinel` inspects Git status, diff, and remote; generates a title and body; then selects a suitable already-installed client for the hosting platform. It prefers `gh` for GitHub and discovers another client for other remotes.
+- `/mr-sentinel` inspects Git status, diff, and remote; then selects a suitable already-installed client for the hosting platform. It prefers `gh` for GitHub and discovers another client for other remotes. It monitors an existing or newly created merge request until it is merged or closed.
 - `mr_browser_acceptance` performs bounded Playwright CLI actions and preserves a PNG screenshot plus command log.
 
-The command does not install clients, change authentication, or expose credentials. It asks for confirmation before common commit, push, and merge-request creation commands.
+The command does not install clients, change authentication, or expose credentials. It asks for confirmation before `gh pr create`, `gh repo create`, and `glab mr create`; Git commits and pushes run without an extension confirmation.
 
 ## Browser configuration
 
