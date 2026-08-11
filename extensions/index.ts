@@ -76,10 +76,18 @@ function truncate(output: string): string {
 }
 
 type MergeRequest = {
+  kind: "PR" | "MR";
+  number: number;
   state: string;
   url?: string;
   baseRef?: string;
 };
+
+type HerdrResponse<T> = { result: T };
+
+type HerdrPane = { pane_id: string; tab_id: string; workspace_id: string };
+type HerdrWorkspace = { workspace_id: string };
+type HerdrTab = { tab_id: string };
 
 const MONITOR_DELAYS_MS = [5, 10, 20, 40, 90].map((minutes) => minutes * 60_000);
 const REPEAT_MONITOR_DELAY_MS = 90 * 60_000;
@@ -88,6 +96,8 @@ export default function mrSentinel(pi: ExtensionAPI) {
   let monitorTimer: ReturnType<typeof setTimeout> | undefined;
   let monitorAttempt = 0;
   let conflictResolutionQueued = false;
+  let mrSessionPrefix: string | undefined;
+  let lastHerdrRename: string | undefined;
 
   const nextMonitorDelay = () => MONITOR_DELAYS_MS[monitorAttempt++] ?? REPEAT_MONITOR_DELAY_MS;
 
@@ -100,16 +110,58 @@ export default function mrSentinel(pi: ExtensionAPI) {
   }
 
   async function findMergeRequest(cwd: string): Promise<MergeRequest | undefined> {
-    const gh = await tryExec("gh", ["pr", "view", "--json", "state,url,baseRefName"], cwd);
+    const gh = await tryExec("gh", ["pr", "view", "--json", "number,state,url,baseRefName"], cwd);
     if (gh?.code === 0) {
-      const result = JSON.parse(gh.stdout) as { state: string; url?: string; baseRefName?: string };
-      return { state: result.state, url: result.url, baseRef: result.baseRefName };
+      const result = JSON.parse(gh.stdout) as { number: number; state: string; url?: string; baseRefName?: string };
+      return { kind: "PR", number: result.number, state: result.state, url: result.url, baseRef: result.baseRefName };
     }
 
     const glab = await tryExec("glab", ["mr", "view", "--output", "json"], cwd);
     if (!glab || glab.code !== 0) return undefined;
-    const result = JSON.parse(glab.stdout) as { state: string; web_url?: string; target_branch?: string };
-    return { state: result.state, url: result.web_url, baseRef: result.target_branch };
+    const result = JSON.parse(glab.stdout) as { iid: number; state: string; web_url?: string; target_branch?: string };
+    return { kind: "MR", number: result.iid, state: result.state, url: result.web_url, baseRef: result.target_branch };
+  }
+
+  function setSessionNameForMergeRequest(mr: MergeRequest): string {
+    const prefix = mr.kind === "PR" ? `#${mr.number}` : `!${mr.number}`;
+    const currentName = pi.getSessionName() ?? "";
+    const baseName = mrSessionPrefix && currentName.startsWith(mrSessionPrefix)
+      ? currentName.slice(mrSessionPrefix.length).trimStart()
+      : currentName;
+    const sessionName = [prefix, baseName].filter(Boolean).join(" ");
+    mrSessionPrefix = prefix;
+    pi.setSessionName(sessionName);
+    return sessionName;
+  }
+
+  async function syncHerdrSessionName(sessionName: string, cwd: string) {
+    if (process.env.HERDR_ENV !== "1") return;
+    const current = await tryExec("herdr", ["pane", "current"], cwd);
+    if (current?.code !== 0) return;
+    const pane = (JSON.parse(current.stdout) as HerdrResponse<{ pane: HerdrPane }>).result.pane;
+    const [workspaces, tabs, panes] = await Promise.all([
+      tryExec("herdr", ["workspace", "list"], cwd),
+      tryExec("herdr", ["tab", "list", "--workspace", pane.workspace_id], cwd),
+      tryExec("herdr", ["pane", "list", "--workspace", pane.workspace_id], cwd),
+    ]);
+    if (!workspaces || !tabs || !panes || workspaces.code !== 0 || tabs.code !== 0 || panes.code !== 0) return;
+
+    const workspace = (JSON.parse(workspaces.stdout) as HerdrResponse<{ workspaces: HerdrWorkspace[] }>).result.workspaces
+      .find((item) => item.workspace_id === pane.workspace_id);
+    const scopedTabs = (JSON.parse(tabs.stdout) as HerdrResponse<{ tabs: HerdrTab[] }>).result.tabs;
+    const scopedPanes = (JSON.parse(panes.stdout) as HerdrResponse<{ panes: HerdrPane[] }>).result.panes;
+    if (!workspace) return;
+
+    const panesInTab = scopedPanes.filter((item) => item.tab_id === pane.tab_id);
+    const target = panesInTab.length > 1
+      ? { type: "pane", id: pane.pane_id }
+      : scopedTabs.length > 1
+        ? { type: "tab", id: pane.tab_id }
+        : { type: "workspace", id: workspace.workspace_id };
+    const renameKey = `${target.type}:${target.id}:${sessionName}`;
+    if (renameKey === lastHerdrRename) return;
+    const renamed = await tryExec("herdr", [target.type, "rename", target.id, sessionName], cwd);
+    if (renamed?.code === 0) lastHerdrRename = renameKey;
   }
 
   async function rebaseIfBehind(cwd: string, baseRef: string, ctx: { ui: { setStatus(key: string, value?: string): void } }): Promise<boolean> {
@@ -155,11 +207,14 @@ export default function mrSentinel(pi: ExtensionAPI) {
         const mr = await findMergeRequest(ctx.cwd);
         if (!mr) {
           ctx.ui.setStatus("mr-sentinel", "MR monitor: waiting for a merge request");
-        } else if (["MERGED", "CLOSED", "merged", "closed"].includes(mr.state)) {
-          ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}`);
-          monitorTimer = undefined;
-          return;
         } else {
+          const sessionName = setSessionNameForMergeRequest(mr);
+          void syncHerdrSessionName(sessionName, ctx.cwd);
+          if (["MERGED", "CLOSED", "merged", "closed"].includes(mr.state)) {
+            ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}`);
+            monitorTimer = undefined;
+            return;
+          }
           const awaitingConflictResolution = mr.baseRef && await rebaseIfBehind(ctx.cwd, mr.baseRef, ctx);
           if (!awaitingConflictResolution) {
             ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}${mr.url ? ` (${mr.url})` : ""}`);
