@@ -117,9 +117,27 @@ export default function mrSentinel(pi: ExtensionAPI) {
     }
 
     const glab = await tryExec("glab", ["mr", "view", "--output", "json"], cwd);
-    if (!glab || glab.code !== 0) return undefined;
-    const result = JSON.parse(glab.stdout) as { iid: number; state: string; web_url?: string; target_branch?: string };
-    return { kind: "MR", number: result.iid, state: result.state, url: result.web_url, baseRef: result.target_branch };
+    if (glab?.code === 0) {
+      const result = JSON.parse(glab.stdout) as { iid: number; state: string; web_url?: string; target_branch?: string };
+      return { kind: "MR", number: result.iid, state: result.state, url: result.web_url, baseRef: result.target_branch };
+    }
+
+    const [remote, branch] = await Promise.all([
+      tryExec("git", ["remote", "get-url", "origin"], cwd),
+      tryExec("git", ["branch", "--show-current"], cwd),
+    ]);
+    const repo = remote?.code === 0 && remote.stdout.trim().match(/(?:[:/])([^/:]+\/[^/]+?)(?:\.git)?\s*$/)?.[1];
+    const sourceBranch = branch?.code === 0 ? branch.stdout.trim() : "";
+    if (!repo || !sourceBranch) return undefined;
+
+    for (const status of ["open", "merged", "closed"] as const) {
+      const listed = await tryExec("bitscli", ["codebase", "mr", "list", "-R", repo, "--status", status, "--page-size", "100"], cwd);
+      if (!listed || listed.code !== 0) continue;
+      const result = JSON.parse(listed.stdout) as { MergeRequests?: Array<{ Number: number; Status: string; SourceBranchName: string; TargetBranchName?: string; URL?: string }> };
+      const mr = result.MergeRequests?.find((item) => item.SourceBranchName === sourceBranch);
+      if (mr) return { kind: "MR", number: mr.Number, state: mr.Status, url: mr.URL, baseRef: mr.TargetBranchName };
+    }
+    return undefined;
   }
 
   function setSessionNameForMergeRequest(mr: MergeRequest): string {
@@ -236,7 +254,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
   pi.on("tool_result", (event, ctx) => {
     if (event.toolName !== "bash" || event.isError) return;
     const command = (event.input as { command?: string }).command ?? "";
-    if (/(?:^|[;&|]\s*)(?:gh\s+(?:pr|repo)|glab\s+mr)\s+create\b/m.test(command)) startMonitor(ctx);
+    if (/(?:^|[;&|]\s*)(?:gh\s+(?:pr|repo)|glab\s+mr|bitscli\s+codebase\s+mr)\s+create\b/m.test(command)) startMonitor(ctx);
   });
 
   pi.registerCommand("mr-sentinel", {
