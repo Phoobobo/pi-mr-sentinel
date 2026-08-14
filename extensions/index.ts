@@ -1,4 +1,4 @@
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import {
@@ -183,8 +183,17 @@ export default function mrSentinel(pi: ExtensionAPI) {
   }
 
   async function rebaseIfBehind(cwd: string, baseRef: string, ctx: { ui: { setStatus(key: string, value?: string): void } }): Promise<boolean> {
-    const paused = await pi.exec("git", ["rev-parse", "-q", "--verify", "REBASE_HEAD"], { cwd, timeout: COMMAND_TIMEOUT_MS });
-    if (paused.code === 0) {
+    const rebasePaths = await Promise.all(["rebase-merge", "rebase-apply"].map(async (name) => {
+      const path = await pi.exec("git", ["rev-parse", "--git-path", name], { cwd, timeout: COMMAND_TIMEOUT_MS });
+      if (path.code !== 0) return false;
+      try {
+        await access(path.stdout.trim());
+        return true;
+      } catch {
+        return false;
+      }
+    }));
+    if (rebasePaths.some(Boolean)) {
       ctx.ui.setStatus("mr-sentinel", "MR monitor: rebase conflict needs resolution");
       if (!conflictResolutionQueued) {
         conflictResolutionQueued = true;
@@ -217,6 +226,22 @@ export default function mrSentinel(pi: ExtensionAPI) {
     throw new Error(`rebase failed: ${truncate(rebase.stderr || rebase.stdout)}`);
   }
 
+  async function executorPrompt(): Promise<string> {
+    const babysit = pi.getCommands().find((command) =>
+      command.source === "skill" && command.name.replace(/^skill:/, "") === "babysit",
+    );
+    if (babysit) {
+      try {
+        const instructions = await readFile(babysit.sourceInfo.path, "utf8");
+        return `Execute the current merge request using the available babysit skill. Follow its instructions below as the working mode. The mr-sentinel extension independently watches MR state, so do not implement a separate watcher.\n\n${instructions}`;
+      } catch {
+        // Fall back to the built-in mode if a discovered skill can no longer be read.
+      }
+    }
+
+    return "Prepare and keep the current repository's merge request merge-ready. Inspect git status, the relevant diff, and git remote -v first. Select the command-line client appropriate for the remote host: prefer gh for GitHub; for any other host, discover an already-installed suitable client with command -v and --help. Do not install software, alter credentials, expose tokens, or assume a platform-specific client. First check whether this branch already has a merge request. If it does not, generate a concise conventional-commit title and a factual Markdown body without asking me for a title, then commit, push, and create the merge request without asking for confirmation. If an MR exists, resolve clear merge conflicts, valid unresolved comments, and CI failures caused by this branch; push scoped fixes and recheck until it is mergeable, green, and comments are triaged. Do not change CI workflows merely to make checks pass. The extension monitors the merge request after this command starts.";
+  }
+
   function startMonitor(ctx: { cwd: string; ui: { setStatus(key: string, value?: string): void } }) {
     if (monitorTimer) clearTimeout(monitorTimer);
     monitorAttempt = 0;
@@ -234,7 +259,9 @@ export default function mrSentinel(pi: ExtensionAPI) {
             return;
           }
           const awaitingConflictResolution = mr.baseRef && await rebaseIfBehind(ctx.cwd, mr.baseRef, ctx);
-          if (!awaitingConflictResolution) {
+          if (awaitingConflictResolution && mr.url) {
+            ctx.ui.setStatus("mr-sentinel", `MR monitor: rebase conflict needs resolution (${mr.url})`);
+          } else if (!awaitingConflictResolution) {
             ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}${mr.url ? ` (${mr.url})` : ""}`);
           }
         }
@@ -245,6 +272,10 @@ export default function mrSentinel(pi: ExtensionAPI) {
     };
     void poll();
   }
+
+  pi.on("session_start", (_event, ctx) => {
+    if (/(?:^|\s)[!#]\d+\b/.test(pi.getSessionName() ?? "")) startMonitor(ctx);
+  });
 
   pi.on("session_shutdown", () => {
     if (monitorTimer) clearTimeout(monitorTimer);
@@ -261,9 +292,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
     description: "Inspect the current Git change and create/watch a merge request using the host-appropriate CLI",
     handler: async (_args, ctx) => {
       startMonitor(ctx);
-      pi.sendUserMessage(
-        "Prepare a merge request for the current repository. Inspect git status, the relevant diff, and git remote -v first. Select the command-line client appropriate for the remote host: prefer gh for GitHub; for any other host, discover an already-installed suitable client with command -v and --help. Do not install software, alter credentials, expose tokens, or assume a platform-specific client. First check whether this branch already has a merge request. If it does not, generate a concise conventional-commit title and a factual Markdown body without asking me for a title, then commit, push, and create the merge request without asking for confirmation. The extension monitors the merge request after this command starts.",
-      );
+      pi.sendUserMessage(await executorPrompt());
     },
   });
 
