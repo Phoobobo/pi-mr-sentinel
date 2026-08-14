@@ -233,7 +233,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
     if (babysit) {
       try {
         const instructions = await readFile(babysit.sourceInfo.path, "utf8");
-        return `Execute the current merge request using the available babysit skill. Follow its instructions below as the working mode. The mr-sentinel extension independently watches MR state, so do not implement a separate watcher.\n\n${instructions}`;
+        return `Inspect the current branch's merge request first. If none exists, create one now: inspect the relevant diff and remote, generate a concise conventional-commit title and factual Markdown body, push the branch, and create the MR without waiting for optional manual acceptance or unrelated full-suite failures. Once an MR exists, execute it using the available babysit skill below. Follow its instructions as the working mode. The mr-sentinel extension independently watches MR state, so do not implement a separate watcher.\n\n${instructions}`;
       } catch {
         // Fall back to the built-in mode if a discovered skill can no longer be read.
       }
