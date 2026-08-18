@@ -89,17 +89,13 @@ type HerdrPane = { pane_id: string; tab_id: string; workspace_id: string };
 type HerdrWorkspace = { workspace_id: string };
 type HerdrTab = { tab_id: string };
 
-const MONITOR_DELAYS_MS = [5, 10, 20, 40, 90].map((minutes) => minutes * 60_000);
-const REPEAT_MONITOR_DELAY_MS = 90 * 60_000;
+const MONITOR_INTERVAL_MS = 5 * 60_000;
 
 export default function mrSentinel(pi: ExtensionAPI) {
   let monitorTimer: ReturnType<typeof setTimeout> | undefined;
-  let monitorAttempt = 0;
+  let maintenanceQueued = false;
   let conflictResolutionQueued = false;
-  let mrSessionPrefix: string | undefined;
   let lastHerdrRename: string | undefined;
-
-  const nextMonitorDelay = () => MONITOR_DELAYS_MS[monitorAttempt++] ?? REPEAT_MONITOR_DELAY_MS;
 
   async function tryExec(command: string, args: string[], cwd: string) {
     try {
@@ -140,14 +136,13 @@ export default function mrSentinel(pi: ExtensionAPI) {
     return undefined;
   }
 
-  function setSessionNameForMergeRequest(mr: MergeRequest): string {
+  async function setSessionNameForMergeRequest(mr: MergeRequest, cwd: string): Promise<string> {
     const prefix = mr.kind === "PR" ? `#${mr.number}` : `!${mr.number}`;
-    const currentName = pi.getSessionName() ?? "";
-    const baseName = mrSessionPrefix && currentName.startsWith(mrSessionPrefix)
-      ? currentName.slice(mrSessionPrefix.length).trimStart()
-      : currentName;
-    const sessionName = [prefix, baseName].filter(Boolean).join(" ");
-    mrSessionPrefix = prefix;
+    const remote = await tryExec("git", ["remote", "get-url", "origin"], cwd);
+    const originName = remote?.code === 0
+      ? remote.stdout.trim().replace(/\.git$/, "").split(/[/:]/).pop()
+      : undefined;
+    const sessionName = `${prefix}-${originName || "origin"}`;
     pi.setSessionName(sessionName);
     return sessionName;
   }
@@ -242,16 +237,21 @@ export default function mrSentinel(pi: ExtensionAPI) {
     return "Prepare and keep the current repository's merge request merge-ready. Inspect git status, the relevant diff, and git remote -v first. Select the command-line client appropriate for the remote host: prefer gh for GitHub; for any other host, discover an already-installed suitable client with command -v and --help. Do not install software, alter credentials, expose tokens, or assume a platform-specific client. First check whether this branch already has a merge request. If it does not, generate a concise conventional-commit title and a factual Markdown body without asking me for a title, then commit, push, and create the merge request without asking for confirmation. If an MR exists, resolve clear merge conflicts, valid unresolved comments, and CI failures caused by this branch; push scoped fixes and recheck until it is mergeable, green, and comments are triaged. Do not change CI workflows merely to make checks pass. The extension monitors the merge request after this command starts.";
   }
 
+  function queueMaintenance(mr: MergeRequest) {
+    if (maintenanceQueued) return;
+    maintenanceQueued = true;
+    pi.sendUserMessage(`MR !${mr.number} is still open. Actively inspect and resolve its rebase/conflicts, CI failures, and unresolved review comments now. Use the loaded babysit skill when available; otherwise use the MR-sentinel built-in merge-ready workflow. Do not create a new MR or merge this one. ${mr.url ?? ""}`, { deliverAs: "followUp" });
+  }
+
   function startMonitor(ctx: { cwd: string; ui: { setStatus(key: string, value?: string): void } }) {
     if (monitorTimer) clearTimeout(monitorTimer);
-    monitorAttempt = 0;
     const poll = async () => {
       try {
         const mr = await findMergeRequest(ctx.cwd);
         if (!mr) {
           ctx.ui.setStatus("mr-sentinel", "MR monitor: waiting for a merge request");
         } else {
-          const sessionName = setSessionNameForMergeRequest(mr);
+          const sessionName = await setSessionNameForMergeRequest(mr, ctx.cwd);
           void syncHerdrSessionName(sessionName, ctx.cwd);
           if (["MERGED", "CLOSED", "merged", "closed"].includes(mr.state)) {
             ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}`);
@@ -263,18 +263,23 @@ export default function mrSentinel(pi: ExtensionAPI) {
             ctx.ui.setStatus("mr-sentinel", `MR monitor: rebase conflict needs resolution (${mr.url})`);
           } else if (!awaitingConflictResolution) {
             ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}${mr.url ? ` (${mr.url})` : ""}`);
+            queueMaintenance(mr);
           }
         }
       } catch (error) {
         ctx.ui.setStatus("mr-sentinel", `MR monitor error: ${error instanceof Error ? error.message : String(error)}`);
       }
-      monitorTimer = setTimeout(() => void poll(), nextMonitorDelay());
+      monitorTimer = setTimeout(() => void poll(), MONITOR_INTERVAL_MS);
     };
     void poll();
   }
 
   pi.on("session_start", (_event, ctx) => {
     if (/(?:^|\s)[!#]\d+\b/.test(pi.getSessionName() ?? "")) startMonitor(ctx);
+  });
+
+  pi.on("agent_settled", () => {
+    maintenanceQueued = false;
   });
 
   pi.on("session_shutdown", () => {
