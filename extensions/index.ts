@@ -95,6 +95,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
   let monitorTimer: ReturnType<typeof setTimeout> | undefined;
   let maintenanceQueued = false;
   let conflictResolutionQueued = false;
+  const mergedNotifications = new Set<string>();
   let lastHerdrRename: string | undefined;
 
   async function tryExec(command: string, args: string[], cwd: string) {
@@ -243,6 +244,16 @@ export default function mrSentinel(pi: ExtensionAPI) {
     pi.sendUserMessage(`MR !${mr.number} is still open. Actively inspect and resolve its rebase/conflicts, CI failures, and unresolved review comments now. Use the loaded babysit skill when available; otherwise use the MR-sentinel built-in merge-ready workflow. Do not create a new MR or merge this one. ${mr.url ?? ""}`, { deliverAs: "followUp" });
   }
 
+  function notifyMerged(mr: MergeRequest) {
+    const key = `${mr.kind}:${mr.number}`;
+    if (mergedNotifications.has(key)) return;
+    mergedNotifications.add(key);
+    const identifier = mr.kind === "PR" ? `#${mr.number}` : `!${mr.number}`;
+    const notification = `Merge request ${identifier} has merged. The MR watcher has stopped. Run any applicable project-local post-merge skill or workflow now. ${mr.url ?? ""}`;
+    pi.events.emit("mr-sentinel:merged", { mr, notification });
+    pi.sendUserMessage(notification, { deliverAs: "followUp" });
+  }
+
   function startMonitor(ctx: { cwd: string; ui: { setStatus(key: string, value?: string): void } }) {
     if (monitorTimer) clearTimeout(monitorTimer);
     const poll = async () => {
@@ -255,6 +266,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
           void syncHerdrSessionName(sessionName, ctx.cwd);
           if (["MERGED", "CLOSED", "merged", "closed"].includes(mr.state)) {
             ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}`);
+            if (["MERGED", "merged"].includes(mr.state)) notifyMerged(mr);
             monitorTimer = undefined;
             return;
           }
