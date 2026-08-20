@@ -271,7 +271,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
           const sessionName = setSessionNameForMergeRequest(mr);
           void syncHerdrSessionName(sessionName, ctx.cwd);
           if (["MERGED", "CLOSED", "merged", "closed"].includes(mr.state)) {
-            ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}`);
+            ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}${mr.url ? ` (${mr.url})` : ""}`);
             if (["MERGED", "merged"].includes(mr.state)) notifyMerged(mr);
             monitorTimer = undefined;
             return;
