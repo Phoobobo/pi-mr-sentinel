@@ -79,6 +79,7 @@ type MergeRequest = {
   kind: "PR" | "MR";
   number: number;
   state: string;
+  title?: string;
   url?: string;
   baseRef?: string;
 };
@@ -95,7 +96,10 @@ export default function mrSentinel(pi: ExtensionAPI) {
   let monitorTimer: ReturnType<typeof setTimeout> | undefined;
   let maintenanceQueued = false;
   let conflictResolutionQueued = false;
+  let currentMergeRequest: MergeRequest | undefined;
   const mergedNotifications = new Set<string>();
+  const namedSessions = new Map<string, string>();
+  const namingRequested = new Set<string>();
   let lastHerdrRename: string | undefined;
 
   async function tryExec(command: string, args: string[], cwd: string) {
@@ -107,16 +111,16 @@ export default function mrSentinel(pi: ExtensionAPI) {
   }
 
   async function findMergeRequest(cwd: string): Promise<MergeRequest | undefined> {
-    const gh = await tryExec("gh", ["pr", "view", "--json", "number,state,url,baseRefName"], cwd);
+    const gh = await tryExec("gh", ["pr", "view", "--json", "number,state,title,url,baseRefName"], cwd);
     if (gh?.code === 0) {
-      const result = JSON.parse(gh.stdout) as { number: number; state: string; url?: string; baseRefName?: string };
-      return { kind: "PR", number: result.number, state: result.state, url: result.url, baseRef: result.baseRefName };
+      const result = JSON.parse(gh.stdout) as { number: number; state: string; title?: string; url?: string; baseRefName?: string };
+      return { kind: "PR", number: result.number, state: result.state, title: result.title, url: result.url, baseRef: result.baseRefName };
     }
 
     const glab = await tryExec("glab", ["mr", "view", "--output", "json"], cwd);
     if (glab?.code === 0) {
-      const result = JSON.parse(glab.stdout) as { iid: number; state: string; web_url?: string; target_branch?: string };
-      return { kind: "MR", number: result.iid, state: result.state, url: result.web_url, baseRef: result.target_branch };
+      const result = JSON.parse(glab.stdout) as { iid: number; state: string; title?: string; web_url?: string; target_branch?: string };
+      return { kind: "MR", number: result.iid, state: result.state, title: result.title, url: result.web_url, baseRef: result.target_branch };
     }
 
     const [remote, branch] = await Promise.all([
@@ -130,20 +134,19 @@ export default function mrSentinel(pi: ExtensionAPI) {
     for (const status of ["open", "merged", "closed"] as const) {
       const listed = await tryExec("bitscli", ["codebase", "mr", "list", "-R", repo, "--status", status, "--page-size", "100"], cwd);
       if (!listed || listed.code !== 0) continue;
-      const result = JSON.parse(listed.stdout) as { MergeRequests?: Array<{ Number: number; Status: string; SourceBranchName: string; TargetBranchName?: string; URL?: string }> };
+      const result = JSON.parse(listed.stdout) as { MergeRequests?: Array<{ Number: number; Status: string; Title?: string; SourceBranchName: string; TargetBranchName?: string; URL?: string }> };
       const mr = result.MergeRequests?.find((item) => item.SourceBranchName === sourceBranch);
-      if (mr) return { kind: "MR", number: mr.Number, state: mr.Status, url: mr.URL, baseRef: mr.TargetBranchName };
+      if (mr) return { kind: "MR", number: mr.Number, state: mr.Status, title: mr.Title, url: mr.URL, baseRef: mr.TargetBranchName };
     }
     return undefined;
   }
 
-  async function setSessionNameForMergeRequest(mr: MergeRequest, cwd: string): Promise<string> {
-    const prefix = mr.kind === "PR" ? `#${mr.number}` : `!${mr.number}`;
-    const remote = await tryExec("git", ["remote", "get-url", "origin"], cwd);
-    const originName = remote?.code === 0
-      ? remote.stdout.trim().replace(/\.git$/, "").split(/[/:]/).pop()
-      : undefined;
-    const sessionName = `${prefix}-${originName || "origin"}`;
+  const mergeRequestKey = (mr: MergeRequest) => `${mr.kind}:${mr.number}`;
+  const mergeRequestPrefix = (mr: MergeRequest) => `${mr.kind === "PR" ? "#" : "!"}${mr.number}`;
+
+  function setSessionNameForMergeRequest(mr: MergeRequest): string {
+    const name = namedSessions.get(mergeRequestKey(mr));
+    const sessionName = name ? `${mergeRequestPrefix(mr)}-${name}` : mergeRequestPrefix(mr);
     pi.setSessionName(sessionName);
     return sessionName;
   }
@@ -233,6 +236,13 @@ export default function mrSentinel(pi: ExtensionAPI) {
     return "Inspect the current branch's MR. If none exists, inspect the diff and remote, commit/push it, and create a factual MR now. Otherwise keep it merge-ready: resolve scoped conflicts, CI failures, and unresolved comments; push fixes and recheck. Do not change CI configuration just to pass checks. The mr-sentinel extension owns monitoring.";
   }
 
+  function queueSessionNaming(mr: MergeRequest) {
+    const key = mergeRequestKey(mr);
+    if (namedSessions.has(key) || namingRequested.has(key)) return;
+    namingRequested.add(key);
+    pi.sendUserMessage(`Name the current ${mr.kind} ${mergeRequestPrefix(mr)} in 2-5 concise words based on its title${mr.title ? `: ${mr.title}` : ""}. Call mr_sentinel_name_session with only that descriptive name.`, { deliverAs: "followUp" });
+  }
+
   function queueMaintenance(mr: MergeRequest) {
     if (maintenanceQueued) return;
     maintenanceQueued = true;
@@ -257,7 +267,8 @@ export default function mrSentinel(pi: ExtensionAPI) {
         if (!mr) {
           ctx.ui.setStatus("mr-sentinel", "MR monitor: waiting for a merge request");
         } else {
-          const sessionName = await setSessionNameForMergeRequest(mr, ctx.cwd);
+          currentMergeRequest = mr;
+          const sessionName = setSessionNameForMergeRequest(mr);
           void syncHerdrSessionName(sessionName, ctx.cwd);
           if (["MERGED", "CLOSED", "merged", "closed"].includes(mr.state)) {
             ctx.ui.setStatus("mr-sentinel", `MR monitor: ${mr.state.toLowerCase()}`);
@@ -265,6 +276,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
             monitorTimer = undefined;
             return;
           }
+          queueSessionNaming(mr);
           const awaitingConflictResolution = mr.baseRef && await rebaseIfBehind(ctx.cwd, mr.baseRef, ctx);
           if (awaitingConflictResolution && mr.url) {
             ctx.ui.setStatus("mr-sentinel", `MR monitor: rebase conflict needs resolution (${mr.url})`);
@@ -282,6 +294,11 @@ export default function mrSentinel(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", (_event, ctx) => {
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "custom" || entry.customType !== "mr-sentinel-session-name") continue;
+      const data = entry.data as { key?: string; name?: string };
+      if (data.key && data.name) namedSessions.set(data.key, data.name);
+    }
     if (/(?:^|\s)[!#]\d+\b/.test(pi.getSessionName() ?? "")) startMonitor(ctx);
   });
 
@@ -298,6 +315,24 @@ export default function mrSentinel(pi: ExtensionAPI) {
     if (event.toolName !== "bash" || event.isError) return;
     const command = (event.input as { command?: string }).command ?? "";
     if (/(?:^|[;&|]\s*)(?:gh\s+(?:pr|repo)|glab\s+mr|bitscli\s+codebase\s+mr|bytedcli\b[\s\S]*?\bcodebase\s+mr)\s+create\b/m.test(command)) startMonitor(ctx);
+  });
+
+  pi.registerTool({
+    name: "mr_sentinel_name_session",
+    label: "Name MR Sentinel Session",
+    description: "Set the concise descriptive suffix for the current monitored merge request session",
+    parameters: Type.Object({ name: Type.String({ minLength: 1, maxLength: 80 }) }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!currentMergeRequest) throw new Error("No merge request is currently being monitored");
+      const name = params.name.trim().replace(/\s+/g, " ").replace(/^[-#]+|[-#]+$/g, "");
+      if (!name) throw new Error("name must contain a letter or number");
+      const key = mergeRequestKey(currentMergeRequest);
+      namedSessions.set(key, name);
+      const sessionName = setSessionNameForMergeRequest(currentMergeRequest);
+      pi.appendEntry("mr-sentinel-session-name", { key, name });
+      void syncHerdrSessionName(sessionName, ctx.cwd);
+      return { content: [{ type: "text", text: `Named session ${sessionName}` }], details: { key, name, sessionName } };
+    },
   });
 
   pi.registerCommand("mr-sentinel", {
