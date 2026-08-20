@@ -302,7 +302,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
   pi.on("tool_result", (event, ctx) => {
     if (event.toolName !== "bash" || event.isError) return;
     const command = (event.input as { command?: string }).command ?? "";
-    if (/(?:^|[;&|]\s*)(?:gh\s+(?:pr|repo)|glab\s+mr|bitscli\s+codebase\s+mr)\s+create\b/m.test(command)) startMonitor(ctx);
+    if (/(?:^|[;&|]\s*)(?:gh\s+(?:pr|repo)|glab\s+mr|bitscli\s+codebase\s+mr|bytedcli\b[\s\S]*?\bcodebase\s+mr)\s+create\b/m.test(command)) startMonitor(ctx);
   });
 
   pi.registerCommand("mr-sentinel", {
