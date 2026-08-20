@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import {
@@ -227,15 +227,10 @@ export default function mrSentinel(pi: ExtensionAPI) {
       command.source === "skill" && command.name.replace(/^skill:/, "") === "babysit",
     );
     if (babysit) {
-      try {
-        const instructions = await readFile(babysit.sourceInfo.path, "utf8");
-        return `Inspect the current branch's merge request first. If none exists, create one now: inspect the relevant diff and remote, generate a concise conventional-commit title and factual Markdown body, push the branch, and create the MR without waiting for optional manual acceptance or unrelated full-suite failures. Once an MR exists, execute it using the available babysit skill below. Follow its instructions as the working mode. The mr-sentinel extension independently watches MR state, so do not implement a separate watcher.\n\n${instructions}`;
-      } catch {
-        // Fall back to the built-in mode if a discovered skill can no longer be read.
-      }
+      return `Inspect the current branch's MR. If none exists, inspect the diff and remote, commit/push it, and create a factual MR now. Then read and follow the babysit skill at ${babysit.sourceInfo.path}. The mr-sentinel extension owns monitoring; do not start another watcher.`;
     }
 
-    return "Prepare and keep the current repository's merge request merge-ready. Inspect git status, the relevant diff, and git remote -v first. Select the command-line client appropriate for the remote host: prefer gh for GitHub; for any other host, discover an already-installed suitable client with command -v and --help. Do not install software, alter credentials, expose tokens, or assume a platform-specific client. First check whether this branch already has a merge request. If it does not, generate a concise conventional-commit title and a factual Markdown body without asking me for a title, then commit, push, and create the merge request without asking for confirmation. If an MR exists, resolve clear merge conflicts, valid unresolved comments, and CI failures caused by this branch; push scoped fixes and recheck until it is mergeable, green, and comments are triaged. Do not change CI workflows merely to make checks pass. The extension monitors the merge request after this command starts.";
+    return "Inspect the current branch's MR. If none exists, inspect the diff and remote, commit/push it, and create a factual MR now. Otherwise keep it merge-ready: resolve scoped conflicts, CI failures, and unresolved comments; push fixes and recheck. Do not change CI configuration just to pass checks. The mr-sentinel extension owns monitoring.";
   }
 
   function queueMaintenance(mr: MergeRequest) {
