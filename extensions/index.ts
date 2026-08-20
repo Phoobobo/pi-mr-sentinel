@@ -309,7 +309,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
     description: "Inspect the current Git change and create/watch a merge request using the host-appropriate CLI",
     handler: async (_args, ctx) => {
       startMonitor(ctx);
-      pi.sendUserMessage(await executorPrompt());
+      pi.sendUserMessage(await executorPrompt(), { deliverAs: "followUp" });
     },
   });
 
