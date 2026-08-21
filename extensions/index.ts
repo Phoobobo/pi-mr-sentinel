@@ -94,6 +94,7 @@ const MONITOR_INTERVAL_MS = 5 * 60_000;
 
 export default function mrSentinel(pi: ExtensionAPI) {
   let monitorTimer: ReturnType<typeof setTimeout> | undefined;
+  let monitorGeneration = 0;
   let maintenanceQueued = false;
   let conflictResolutionQueued = false;
   let currentMergeRequest: MergeRequest | undefined;
@@ -261,6 +262,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
 
   function startMonitor(ctx: { cwd: string; ui: { setStatus(key: string, value?: string): void } }) {
     if (monitorTimer) clearTimeout(monitorTimer);
+    const generation = ++monitorGeneration;
     const poll = async () => {
       try {
         const mr = await findMergeRequest(ctx.cwd);
@@ -288,7 +290,9 @@ export default function mrSentinel(pi: ExtensionAPI) {
       } catch (error) {
         ctx.ui.setStatus("mr-sentinel", `MR monitor error: ${error instanceof Error ? error.message : String(error)}`);
       }
-      monitorTimer = setTimeout(() => void poll(), MONITOR_INTERVAL_MS);
+      if (generation === monitorGeneration) {
+        monitorTimer = setTimeout(() => void poll(), MONITOR_INTERVAL_MS);
+      }
     };
     void poll();
   }
@@ -308,6 +312,7 @@ export default function mrSentinel(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     if (monitorTimer) clearTimeout(monitorTimer);
+    monitorGeneration += 1;
     monitorTimer = undefined;
   });
 
@@ -336,8 +341,18 @@ export default function mrSentinel(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("mr-sentinel", {
-    description: "Inspect the current Git change and create/watch a merge request using the host-appropriate CLI",
-    handler: async (_args, ctx) => {
+    description: "Inspect/create/watch a merge request; use /mr-sentinel stop to stop this session's monitor",
+    handler: async (args, ctx) => {
+      if (args.trim() === "stop") {
+        if (monitorTimer) clearTimeout(monitorTimer);
+        monitorGeneration += 1;
+        monitorTimer = undefined;
+        maintenanceQueued = false;
+        conflictResolutionQueued = false;
+        currentMergeRequest = undefined;
+        ctx.ui.setStatus("mr-sentinel", "MR monitor: stopped");
+        return;
+      }
       startMonitor(ctx);
       pi.sendUserMessage(await executorPrompt(), { deliverAs: "followUp" });
     },
