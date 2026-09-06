@@ -349,8 +349,10 @@ export default function mrSentinel(pi: ExtensionAPI) {
         monitorTimer = undefined;
         maintenanceQueued = false;
         conflictResolutionQueued = false;
-        currentMergeRequest = undefined;
-        ctx.ui.setStatus("mr-sentinel", "MR monitor: stopped");
+        ctx.ui.setStatus(
+          "mr-sentinel",
+          `MR monitor: stopped${currentMergeRequest?.url ? ` (${currentMergeRequest.url})` : ""}`,
+        );
         return;
       }
       startMonitor(ctx);
